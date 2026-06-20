@@ -25,18 +25,30 @@ const BEACON_INTERVAL_US = 1000;
 /** Shared research protocol options (monitor + game). */
 const RESEARCH = {
   EXERCISES: [
-    { value: 'jump',       label: 'Jump' },
-    { value: 'squat',      label: 'Squat' },
-    { value: 'lunge',      label: 'Lunge' },
-    { value: 'deadlift',   label: 'Deadlift' },
-    { value: 'calf_raise', label: 'Calf Raise' },
-    { value: 'box_jump',   label: 'Box Jump' },
+    { value: 'leg_press',      label: 'Leg Press' },
+    { value: 'lunges',         label: 'Lunges' },
+    { value: 'leg_curl',       label: 'Leg Curl' },
+    { value: 'squarts',        label: 'Squarts' },
+    { value: 'calf_raise',     label: 'Calf Raise' },
+    { value: 'walking',        label: 'Walking' },
+    { value: 'jumpin',         label: 'Jumpin' },
+    { value: 'stair_up_climb', label: 'Stair Up Climb' },
+    { value: 'stair_down',     label: 'Stair Down' },
   ],
   TRIALS: [1, 2, 3, 4, 5],
   SEX_OPTIONS: [
     { value: 'male',   label: 'Male' },
     { value: 'female', label: 'Female' },
   ],
+};
+
+// Channel label map for CSV headers
+const CH_MUSCLE_LABEL = { 1: 'muscle1', 2: 'muscle2', 3: 'muscle3', 4: 'muscle4' };
+const CH_MUSCLE_FULL  = {
+  1: 'muscle1',
+  2: 'muscle2',
+  3: 'muscle3',
+  4: 'muscle4',
 };
 
 // ── Biquad IIR (RBJ cookbook) ────────────────────────────────────────────────
@@ -220,6 +232,18 @@ class ChannelData {
     this._hwRate = hz;
   }
 
+  clear() {
+    this.buffer    = [];
+    this.rms            = 0;
+    this.mean           = 0;
+    this.peak           = 0;
+    this.peak_to_peak   = 0;
+    this.sample_rate    = 0;
+    this._hwRate        = 0;
+    this._sampleCount   = 0;
+    this._rateWindowStart = performance.now();
+  }
+
   ingest(samples) {
     for (const s of samples) {
       this.buffer.push(s);
@@ -368,7 +392,7 @@ class Recorder {
     this._age                = 25;
     this._weight_kg          = 70;
     this._height_cm          = 170;
-    this._exercise           = 'squat';
+    this._exercise           = 'leg_press';
     this._trial_no           = 1;
     this._session_timestamp  = '';
     this._timezone           = getSystemTimezone();
@@ -412,7 +436,7 @@ class Recorder {
     age          = 25,
     weight_kg    = 70,
     height_cm    = 170,
-    exercise     = 'squat',
+    exercise     = 'leg_press',
     trial_no     = 1,
   } = {}) {
     this._chSamples    = { 1: [], 2: [], 3: [], 4: [] };
@@ -422,7 +446,7 @@ class Recorder {
     this._age          = Math.max(1, Math.min(120, parseInt(age, 10) || 25));
     this._weight_kg    = weight_kg;
     this._height_cm    = height_cm;
-    this._exercise     = exercise || 'squat';
+    this._exercise     = exercise || 'leg_press';
     this._trial_no     = Math.max(1, Math.min(5, parseInt(trial_no, 10) || 1));
     this._label        = (label || this._exercise).trim() || this._exercise;
     this._session_timestamp = new Date().toISOString();
@@ -511,6 +535,68 @@ class Recorder {
     };
   }
 
+  /**
+   * Compute data alignment statistics across all active channels.
+   * Returns:
+   *   - totalFrames:       total unique timestamp slots across all channels
+   *   - alignedFrames:     frames where ALL active channels have data
+   *   - alignedPct:        % of frames that are fully aligned
+   *   - perChannel:        per-channel sample count and % of total frames covered
+   *   - active:            list of active channel IDs
+   *   - durationS:         estimated session duration in seconds
+   */
+  getAlignmentStats() {
+    const active = [1, 2, 3, 4].filter(c => this._chSamples[c].length > 0);
+    if (active.length === 0) {
+      return { active: [], totalFrames: 0, alignedFrames: 0, alignedPct: 0, perChannel: {}, durationS: 0 };
+    }
+
+    // Build Set<tsUs> per channel
+    const tsSets = {};
+    for (const c of active) {
+      tsSets[c] = new Set(this._chSamples[c].map(s => s.tsUs));
+    }
+
+    // Union of all timestamps = total possible frames
+    const unionTs = new Set();
+    for (const c of active) for (const ts of tsSets[c]) unionTs.add(ts);
+    const totalFrames = unionTs.size;
+
+    if (totalFrames === 0) {
+      return { active, totalFrames: 0, alignedFrames: 0, alignedPct: 0, perChannel: {}, durationS: 0 };
+    }
+
+    // Count frames where ALL active channels have data (intersection)
+    let alignedFrames = 0;
+    for (const ts of unionTs) {
+      if (active.every(c => tsSets[c].has(ts))) alignedFrames++;
+    }
+
+    const alignedPct = Math.round((alignedFrames / totalFrames) * 1000) / 10;
+
+    // Per-channel: how many of the total frames does this channel cover?
+    const perChannel = {};
+    for (const c of active) {
+      const count = tsSets[c].size;
+      perChannel[c] = {
+        samples: count,
+        coveragePct: Math.round((count / totalFrames) * 1000) / 10,
+      };
+    }
+
+    // Estimate session duration from timestamp span
+    let minTs = Infinity, maxTs = -Infinity;
+    for (const c of active) {
+      for (const ts of tsSets[c]) {
+        if (ts < minTs) minTs = ts;
+        if (ts > maxTs) maxTs = ts;
+      }
+    }
+    const durationS = (maxTs - minTs) > 0 ? Math.round((maxTs - minTs) / 1e6 * 10) / 10 : 0;
+
+    return { active, totalFrames, alignedFrames, alignedPct, perChannel, durationS };
+  }
+
   _prepareChannelValues(active, applyFilter) {
     const chValues = {};
     for (const c of active) {
@@ -538,174 +624,127 @@ class Recorder {
   }
 
   /**
-   * Align channels by hardware syncKey (frame_id × 10000 + intra-batch index).
-   * Since frame_id is the master's global beacon counter, it is identical for
-   * simultaneous samples on all channels → perfect alignment when firmware
-   * provides frame_id_start (which it always does now).
+   * Align channels by hardware timestamp (tsUs = frame_id * dt_us us).
+   * Every slave samples on the SAME master beacon tick, so two samples with
+   * identical tsUs are genuinely simultaneous.  Join on tsUs -> true parallel.
    */
   _buildAlignedRows(active, chValues, medianDtUs) {
-    const hasSync = active.every(c =>
-      this._chSamples[c].length > 0 &&
-      this._chSamples[c].every(s => s.syncKey != null)
-    );
-
-    if (hasSync) {
-      const keySet = new Set();
-      for (const c of active)
-        for (const s of this._chSamples[c]) keySet.add(s.syncKey);
-      const keys  = Array.from(keySet).sort((a, b) => a - b);
-      const byKey = {};
-      for (const c of active) {
-        byKey[c] = new Map(
-          this._samplesWithValues(c, chValues[c]).map(s => [s.syncKey, s])
-        );
-      }
-      return keys.map((key, idx) => {
-        const row = { index: idx, relTimeMs: null, cells: {} };
-        let refTs = null;
-        for (const c of active) {
-          const hit    = byKey[c].get(key);
-          row.cells[c] = hit ? {
-            tsUs:      hit.tsUs,
-            valMv:     hit.valMv,
-            wallIso:   hit.wallIso,
-            wallLocal: hit.wallLocal,
-          } : null;
-          if (hit && refTs == null) refTs = hit.tsUs;
+    // Build Map<tsUs, sample> per channel (keep first on duplicate ts)
+    const byTs = {};
+    for (const c of active) {
+      byTs[c] = new Map();
+      for (const s of this._samplesWithValues(c, chValues[c])) {
+        if (!byTs[c].has(s.tsUs)) {
+          byTs[c].set(s.tsUs, {
+            tsUs:      s.tsUs,
+            valMv:     s.valMv,
+            wallLocal: s.wallLocal,
+            wallIso:   s.wallIso,
+          });
         }
-        row.refTsUs = refTs;
-        return row;
-      });
+      }
     }
 
-    // Fallback: timestamp-grid alignment (only used if frame_id_start is missing)
-    const tolerance = medianDtUs / 2;
-    const tMin = Math.min(...active.map(c => this._chSamples[c][0].tsUs));
-    const tMax = Math.max(...active.map(c => this._chSamples[c][this._chSamples[c].length - 1].tsUs));
-    const prepared = {};
-    for (const c of active) prepared[c] = this._samplesWithValues(c, chValues[c]);
+    // Union of all tsUs values across all channels, sorted ascending
+    const tsSet = new Set();
+    for (const c of active) for (const ts of byTs[c].keys()) tsSet.add(ts);
+    const sortedTs = Array.from(tsSet).sort((a, b) => a - b);
 
-    const rows = [];
-    let idx = 0;
-    for (let T = tMin; T <= tMax + medianDtUs / 2; T += medianDtUs) {
+    // One output row per timestamp; null where channel missed that beacon
+    return sortedTs.map((ts, idx) => {
       const cells = {};
-      let any = false;
       for (const c of active) {
-        const hit = nearestSample(prepared[c], T, tolerance);
-        cells[c]  = hit ? {
+        const hit = byTs[c].get(ts);
+        cells[c] = hit ? {
           tsUs:      hit.tsUs,
           valMv:     hit.valMv,
-          wallIso:   hit.wallIso,
           wallLocal: hit.wallLocal,
+          wallIso:   hit.wallIso,
         } : null;
-        if (hit) any = true;
       }
-      if (any) rows.push({ index: idx++, refTsUs: T, relTimeMs: (T - tMin) / 1000, cells });
-    }
-    return rows;
+      return { index: idx, refTsUs: ts, relTimeMs: null, cells };
+    });
   }
 
-  _metaRowPrefix() {
-    return [
-      this._participant,
-      this._sex,
-      this._age,
-      this._weight_kg,
-      this._height_cm,
-      this._exercise,
-      this._trial_no,
-      this._session_timestamp,
-      this._label,
-      this._timezone,
-    ];
+  /** Build the 2-line metadata comment header. */
+  _metaHeader() {
+    const line1 = `# participant=${this._participant} | sex=${this._sex} | age=${this._age} | weight_kg=${this._weight_kg} | height_cm=${this._height_cm}`;
+    const line2 = `# exercise=${this._exercise} | trial_no=${this._trial_no} | label=${this._label} | session=${this._session_timestamp} | tz=${this._timezone}`;
+    return line1 + '\n' + line2;
   }
 
+  /**
+   * Clean CSV export:
+   *   Line 1: # participant metadata comment
+   *   Line 2: # session metadata comment
+   *   Line 3: column header
+   *   Line 4+: datetime_local, ch1_mV, ch2_mV, ch3_mV  (NaN where channel missing)
+   *
+   * Alignment: exact sync key (frame_id × 10000 + i) — same shared epoch for all channels.
+   */
   toCSV(applyFilter = true) {
     const active = [1, 2, 3, 4].filter(c => this._chSamples[c].length);
-    if (!active.length) return 'sample_index,rel_time_ms\n';
+    if (!active.length) return '# no data\ndatetime_local\n';
 
     const medianDtUs = estimateMedianDtUs(this._chSamples, active);
     const chValues   = this._prepareChannelValues(active, applyFilter);
     const aligned    = this._buildAlignedRows(active, chValues, medianDtUs);
-    const tMin       = aligned.length ? (aligned[0].refTsUs ?? 0) : 0;
-    const filterNote = applyFilter ? 'filtered' : 'raw';
+    const suffix     = applyFilter ? 'filtered_mV' : 'raw_mV';
 
-    const header = [
-      'participant', 'sex', 'age', 'weight_kg', 'height_cm',
-      'exercise', 'trial_no', 'session_timestamp', 'label', 'timezone',
-      'sample_index', 'ref_timestamp_us', 'rel_time_ms',
-      'recorded_at_local', 'recorded_at_iso',
-    ];
-    for (const c of active) {
-      header.push(`esp_t0_ch${c}_ms`, `ts_ch${c}_us`, `ch${c}_${filterNote}`);
-    }
-    header.push('channels_present');
+    // Build column headers using muscle names
+    const chHeaders = active.map(c => {
+      const muscle = CH_MUSCLE_FULL[c] ?? `ch${c}`;
+      return `${muscle}_${suffix}`;
+    });
+    const header = ['datetime_local', ...chHeaders].join(',');
 
-    const rows = [header.join(',')];
+    const lines = [this._metaHeader(), header];
+
     for (const row of aligned) {
-      const relMs = row.relTimeMs != null
-        ? Math.round(row.relTimeMs * 1000) / 1000
-        : Math.round((row.refTsUs - tMin) / 1000 * 1000) / 1000;
+      // Use the first non-null cell's wall timestamp as the row timestamp
       const refCell = active.map(c => row.cells[c]).find(Boolean);
-      const present = [];
-      const data = [
-        ...this._metaRowPrefix(),
-        row.index,
-        row.refTsUs,
-        relMs,
-        refCell?.wallLocal ?? '',
-        refCell?.wallIso   ?? '',
-      ];
-      for (const c of active) {
+      const dt = refCell?.wallLocal ?? refCell?.wallIso ?? '';
+
+      const vals = active.map(c => {
         const cell = row.cells[c];
-        if (cell) {
-          const espT0 = this._chSamples[c].find(s => s.tsUs === cell.tsUs)?.espT0Ms ?? '';
-          data.push(espT0, cell.tsUs, Math.round(cell.valMv * 100) / 100);
-          present.push(c);
-        } else {
-          data.push('', '', '');
-        }
-      }
-      data.push(present.join('|') || '');
-      rows.push(data.join(','));
+        return cell ? Math.round(cell.valMv * 100) / 100 : '';
+      });
+
+      lines.push([dt, ...vals].join(','));
     }
-    return rows.join('\n');
+
+    return lines.join('\n');
   }
 
-  /** Long-format CSV: one row per sample — no cross-channel alignment assumptions. */
+  /**
+   * Long-format CSV: one row per sample, all channels stacked.
+   * Still uses 2-line metadata header. Good for debugging individual channel timing.
+   * Format: datetime_local, channel, muscle, hw_timestamp_us, value_mV
+   */
   toLongCSV(applyFilter = true) {
     const active = [1, 2, 3, 4].filter(c => this._chSamples[c].length);
-    if (!active.length) return 'channel,timestamp_us,value_mV\n';
+    if (!active.length) return '# no data\ndatetime_local,channel,muscle,hw_timestamp_us,value_mV\n';
 
     const chValues   = this._prepareChannelValues(active, applyFilter);
-    const filterNote = applyFilter ? 'filtered' : 'raw';
-    const header = [
-      'participant', 'sex', 'age', 'weight_kg', 'height_cm',
-      'exercise', 'trial_no', 'session_timestamp', 'label', 'timezone',
-      'channel', 'esp_t0_ms', 'hw_timestamp_us',
-      'recorded_at_local', 'recorded_at_iso',
-      `value_mV_${filterNote}`, 'sync_key',
-    ];
-    const rows   = [header.join(',')];
-    const prefix = this._metaRowPrefix();
+    const suffix     = applyFilter ? 'filtered_mV' : 'raw_mV';
+    const header     = ['datetime_local', 'channel', 'muscle', 'hw_timestamp_us', suffix].join(',');
+    const lines      = [this._metaHeader(), header];
 
     for (const c of active) {
       const samples = this._chSamples[c];
       const vals    = chValues[c];
+      const muscle  = CH_MUSCLE_FULL[c] ?? `ch${c}`;
       for (let i = 0; i < samples.length; i++) {
-        rows.push([
-          ...prefix,
+        lines.push([
+          samples[i].wallLocal || samples[i].wallIso || '',
           c,
-          samples[i].espT0Ms,
+          muscle,
           samples[i].tsUs,
-          samples[i].wallLocal,
-          samples[i].wallIso,
           Math.round(vals[i] * 100) / 100,
-          samples[i].syncKey ?? '',
         ].join(','));
       }
     }
-    return rows.join('\n');
+    return lines.join('\n');
   }
 }
 
@@ -730,6 +769,17 @@ const EmgEngine = {
 
   setStats(stats) {
     this._stats = { ...stats };
+  },
+
+  clearAllData() {
+    for (const chId of [1, 2, 3, 4]) {
+      this._channels[chId].clear();
+    }
+    this.resetFilters();
+    this.recorder.reset();
+    this._stats = { rx_packets: 0, rx_errors: 0, bytes_received: 0 };
+    this._lastBroadcast = 0;
+    this._emit();
   },
 
   setConnected(connected) {
@@ -804,16 +854,17 @@ const EmgEngine = {
     }
   },
 
-  /** Trigger browser download of recorder CSV. */
+  /** Download clean aligned CSV (2-line meta + datetime + muscle columns). */
   downloadRecorderCSV(applyFilter = true) {
     if (this.recorder.sampleCount === 0) return false;
     const csv    = this.recorder.toCSV(applyFilter);
-    const suffix = applyFilter ? 'aligned_filtered' : 'aligned_raw';
+    const suffix = applyFilter ? 'filtered' : 'raw';
     const name   = `${this.recorder.filenameBase()}_${suffix}.csv`;
     EmgEngine._downloadText(csv, name);
     return true;
   },
 
+  /** Download long-format CSV (one row per sample, stacked channels). */
   downloadRecorderLongCSV(applyFilter = true) {
     if (this.recorder.sampleCount === 0) return false;
     const csv    = this.recorder.toLongCSV(applyFilter);
